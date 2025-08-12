@@ -1,1 +1,172 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
 
+contract SportsPredictionMarket {
+    struct Market {
+        uint256 id;
+        string description;
+        uint256 deadline;
+        bool isResolved;
+        uint8 winningOutcome; // 0 = not resolved, 1 = outcome A, 2 = outcome B
+        uint256 totalPoolA;
+        uint256 totalPoolB;
+        address creator;
+    }
+    
+    struct Bet {
+        uint256 amount;
+        uint8 outcome; // 1 = outcome A, 2 = outcome B
+        bool claimed;
+    }
+    
+    mapping(uint256 => Market) public markets;
+    mapping(uint256 => mapping(address => Bet)) public userBets;
+    mapping(address => bool) public authorizedResolvers;
+    
+    uint256 public nextMarketId = 1;
+    address public owner;
+    uint256 public constant PLATFORM_FEE = 3; // 3% platform fee
+    
+    event MarketCreated(uint256 indexed marketId, string description, uint256 deadline);
+    event BetPlaced(uint256 indexed marketId, address indexed user, uint8 outcome, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, uint8 winningOutcome);
+    event WinningsClaimed(uint256 indexed marketId, address indexed user, uint256 amount);
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier onlyAuthorized() {
+        require(authorizedResolvers[msg.sender] || msg.sender == owner, "Not authorized to resolve markets");
+        _;
+    }
+    
+    constructor() {
+        owner = msg.sender;
+        authorizedResolvers[msg.sender] = true;
+    }
+    
+    // Function 1: Create a new prediction market
+    function createMarket(string memory _description, uint256 _deadline) external {
+        require(_deadline > block.timestamp, "Deadline must be in the future");
+        require(bytes(_description).length > 0, "Description cannot be empty");
+        
+        markets[nextMarketId] = Market({
+            id: nextMarketId,
+            description: _description,
+            deadline: _deadline,
+            isResolved: false,
+            winningOutcome: 0,
+            totalPoolA: 0,
+            totalPoolB: 0,
+            creator: msg.sender
+        });
+        
+        emit MarketCreated(nextMarketId, _description, _deadline);
+        nextMarketId++;
+    }
+    
+    // Function 2: Place a bet on a market outcome
+    function placeBet(uint256 _marketId, uint8 _outcome) external payable {
+        require(_marketId < nextMarketId && _marketId > 0, "Market does not exist");
+        require(_outcome == 1 || _outcome == 2, "Invalid outcome (must be 1 or 2)");
+        require(msg.value > 0, "Bet amount must be greater than 0");
+        require(block.timestamp < markets[_marketId].deadline, "Market betting period has ended");
+        require(!markets[_marketId].isResolved, "Market is already resolved");
+        require(userBets[_marketId][msg.sender].amount == 0, "User has already bet on this market");
+        
+        userBets[_marketId][msg.sender] = Bet({
+            amount: msg.value,
+            outcome: _outcome,
+            claimed: false
+        });
+        
+        if (_outcome == 1) {
+            markets[_marketId].totalPoolA += msg.value;
+        } else {
+            markets[_marketId].totalPoolB += msg.value;
+        }
+        
+        emit BetPlaced(_marketId, msg.sender, _outcome, msg.value);
+    }
+    
+    // Function 3: Resolve a market (only authorized users)
+    function resolveMarket(uint256 _marketId, uint8 _winningOutcome) external onlyAuthorized {
+        require(_marketId < nextMarketId && _marketId > 0, "Market does not exist");
+        require(_winningOutcome == 1 || _winningOutcome == 2, "Invalid winning outcome");
+        require(!markets[_marketId].isResolved, "Market is already resolved");
+        require(block.timestamp >= markets[_marketId].deadline, "Cannot resolve before deadline");
+        
+        markets[_marketId].isResolved = true;
+        markets[_marketId].winningOutcome = _winningOutcome;
+        
+        emit MarketResolved(_marketId, _winningOutcome);
+    }
+    
+    // Function 4: Claim winnings from a resolved market
+    function claimWinnings(uint256 _marketId) external {
+        require(_marketId < nextMarketId && _marketId > 0, "Market does not exist");
+        require(markets[_marketId].isResolved, "Market is not resolved yet");
+        require(userBets[_marketId][msg.sender].amount > 0, "No bet found for this user");
+        require(!userBets[_marketId][msg.sender].claimed, "Winnings already claimed");
+        require(userBets[_marketId][msg.sender].outcome == markets[_marketId].winningOutcome, "User did not win");
+        
+        Market memory market = markets[_marketId];
+        Bet memory userBet = userBets[_marketId][msg.sender];
+        
+        uint256 totalWinningPool = (market.winningOutcome == 1) ? market.totalPoolA : market.totalPoolB;
+        uint256 totalLosingPool = (market.winningOutcome == 1) ? market.totalPoolB : market.totalPoolA;
+        
+        // Calculate winnings: user's bet + proportional share of losing pool (minus platform fee)
+        uint256 platformFee = (totalLosingPool * PLATFORM_FEE) / 100;
+        uint256 distributablePool = totalLosingPool - platformFee;
+        uint256 userShare = (userBet.amount * distributablePool) / totalWinningPool;
+        uint256 totalWinnings = userBet.amount + userShare;
+        
+        userBets[_marketId][msg.sender].claimed = true;
+        
+        // Send platform fee to owner
+        if (platformFee > 0) {
+            payable(owner).transfer(platformFee);
+        }
+        
+        payable(msg.sender).transfer(totalWinnings);
+        
+        emit WinningsClaimed(_marketId, msg.sender, totalWinnings);
+    }
+    
+    // Function 5: Add/remove authorized resolvers (only owner)
+    function setAuthorizedResolver(address _resolver, bool _authorized) external onlyOwner {
+        authorizedResolvers[_resolver] = _authorized;
+    }
+    
+    // View functions for getting market and bet information
+    function getMarket(uint256 _marketId) external view returns (Market memory) {
+        require(_marketId < nextMarketId && _marketId > 0, "Market does not exist");
+        return markets[_marketId];
+    }
+    
+    function getUserBet(uint256 _marketId, address _user) external view returns (Bet memory) {
+        return userBets[_marketId][_user];
+    }
+    
+    function calculatePotentialWinnings(uint256 _marketId, address _user) external view returns (uint256) {
+        require(_marketId < nextMarketId && _marketId > 0, "Market does not exist");
+        require(userBets[_marketId][_user].amount > 0, "No bet found for this user");
+        
+        Market memory market = markets[_marketId];
+        Bet memory userBet = userBets[_marketId][_user];
+        
+        uint256 userOutcomePool = (userBet.outcome == 1) ? market.totalPoolA : market.totalPoolB;
+        uint256 oppositePool = (userBet.outcome == 1) ? market.totalPoolB : market.totalPoolA;
+        
+        if (userOutcomePool == 0) return 0;
+        
+        uint256 platformFee = (oppositePool * PLATFORM_FEE) / 100;
+        uint256 distributablePool = oppositePool - platformFee;
+        uint256 userShare = (userBet.amount * distributablePool) / userOutcomePool;
+        
+        return userBet.amount + userShare;
+    }
+}
